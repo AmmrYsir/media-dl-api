@@ -1,4 +1,4 @@
-﻿# Vicatch  Video Download API
+﻿# media-dl-api - Video Download API
 
 A **FastAPI** REST API that wraps [yt-dlp](https://github.com/yt-dlp/yt-dlp) to download videos from YouTube, Instagram, Facebook, TikTok, and any generic HTTP(S) URL.
 
@@ -20,8 +20,8 @@ A **FastAPI** REST API that wraps [yt-dlp](https://github.com/yt-dlp/yt-dlp) to 
 **1. Clone the repository**
 
 ```bash
-git clone https://github.com/your-org/vicatch.git
-cd vicatch
+git clone https://github.com/your-org/media-dl-api.git
+cd media-dl-api
 ```
 
 **2. Create and activate a virtual environment** *(recommended)*
