@@ -14,8 +14,9 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.background import BackgroundTasks
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, HttpUrl, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -48,6 +49,11 @@ YTDLP_TIMEOUT_SECONDS: int = 300     # 5 minutes
 
 # Rate-limit: max downloads per minute per IP.
 RATE_LIMIT: str = "5/minute"
+
+# Maximum allowed video file size. Requests exceeding this are rejected before
+# the actual download begins (and as a yt-dlp --max-filesize safety net).
+MAX_VIDEO_SIZE_BYTES: int = 1 * 1024 * 1024 * 1024   # 1 GB
+MAX_VIDEO_SIZE_LABEL: str = "1 GB"
 
 # Allowed media file extensions that the /downloads/ endpoint will serve.
 ALLOWED_EXTENSIONS: frozenset[str] = frozenset(
@@ -98,6 +104,61 @@ app = FastAPI(
 # Attach rate-limit error handler
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# ---------------------------------------------------------------------------
+# Global exception handlers – always return flat {"error": "..."} JSON
+# ---------------------------------------------------------------------------
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """
+    Flatten Pydantic's verbose 422 validation errors into a single human-readable
+    string so the frontend never sees nested loc/msg/type dicts.
+    """
+    messages = []
+    for err in exc.errors():
+        # e.g. "url: value is not a valid URL"
+        field = " → ".join(str(loc) for loc in err.get("loc", []) if loc != "body")
+        msg = err.get("msg", "Invalid value.")
+        messages.append(f"{field}: {msg}" if field else msg)
+    human = " | ".join(messages) if messages else "Invalid request."
+    logger.warning("Validation error for %s %s: %s", request.method, request.url.path, human)
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"error": human},
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(
+    request: Request, exc: HTTPException
+) -> JSONResponse:
+    """Re-shape HTTPException responses to the flat {"error": "..."} envelope."""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.detail},
+        headers=getattr(exc, "headers", None),
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(
+    request: Request, exc: Exception
+) -> JSONResponse:
+    """
+    Catch-all for any unexpected exception.  Logs the full traceback server-side
+    but only returns a generic message to the caller to prevent info leaks.
+    """
+    logger.exception(
+        "Unhandled exception on %s %s", request.method, request.url.path
+    )
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"error": "An unexpected error occurred. Please try again later."},
+    )
 
 # ---------------------------------------------------------------------------
 # Middleware: CORS
@@ -241,6 +302,38 @@ def _check_disk_quota() -> None:
         )
 
 
+def _probe_file_size(cmd_prefix: list[str], url: str) -> int | None:
+    """
+    Ask yt-dlp for the expected file size without downloading anything.
+
+    Returns the size in bytes, or ``None`` if the platform does not report it.
+    A ``None`` result should be treated as "unknown" – the caller should still
+    apply the ``--max-filesize`` guard on the real download.
+    """
+    probe_cmd = [
+        *cmd_prefix,
+        "--no-playlist",
+        "--skip-download",
+        "--print", "%(filesize,filesize_approx)s",
+        url,
+    ]
+    try:
+        result = subprocess.run(
+            probe_cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,   # metadata probe should be fast
+        )
+        raw = result.stdout.strip().splitlines()
+        value = raw[-1].strip() if raw else ""
+        if value and value != "NA" and value.isdigit():
+            return int(value)
+    except Exception:  # noqa: BLE001
+        pass  # probe failure is non-fatal; real download guard will still apply
+    return None
+
+
 def _run_download(url: str, service_name: str) -> tuple[str, str]:
     """
     Invoke yt-dlp for *url* and return ``(message, filename)`` on success.
@@ -262,10 +355,33 @@ def _run_download(url: str, service_name: str) -> tuple[str, str]:
         *cmd_prefix,
         "--no-playlist",
         "--restrict-filenames",
+        f"--max-filesize={MAX_VIDEO_SIZE_BYTES}",  # safety net if probe couldn't determine size
         "--print", "after_move:filepath",
         "-o", output_template,
         url,
     ]
+
+    # ------------------------------------------------------------------
+    # Pre-download size probe – reject before wasting bandwidth/disk
+    # ------------------------------------------------------------------
+    probed_size = _probe_file_size(cmd_prefix, url)
+    if probed_size is not None and probed_size > MAX_VIDEO_SIZE_BYTES:
+        size_mb = probed_size / 1024 / 1024
+        logger.warning(
+            "Blocked oversized video %.0f MB > limit %s for url=%s",
+            size_mb, MAX_VIDEO_SIZE_LABEL, url,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=(
+                f"Video is too large ({size_mb:.0f} MB). "
+                f"Maximum allowed size is {MAX_VIDEO_SIZE_LABEL}."
+            ),
+        )
+    elif probed_size is None:
+        logger.info("File size unknown for url=%s – proceeding with --max-filesize guard", url)
+    else:
+        logger.info("Pre-download size check passed: %.0f MB for url=%s", probed_size / 1024 / 1024, url)
 
     logger.info("Starting download [service=%s] url=%s", service_name, url)
 
@@ -425,7 +541,7 @@ class DownloadResponse(BaseModel):
 class ErrorResponse(BaseModel):
     """Error detail returned on failure."""
 
-    detail: str
+    error: str
 
 
 # ---------------------------------------------------------------------------
