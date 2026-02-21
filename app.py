@@ -190,8 +190,20 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["Referrer-Policy"] = "no-referrer"
         # Disable browser caching of responses
         response.headers["Cache-Control"] = "no-store"
-        # Restrict what this API response can load/execute (it's pure JSON/binary)
-        response.headers["Content-Security-Policy"] = "default-src 'none'"
+        # Swagger UI / ReDoc need CDN assets – apply a relaxed CSP only on those paths.
+        # All other API responses keep the strict deny-all policy.
+        _docs_paths = {"/docs", "/redoc", "/openapi.json"}
+        if request.url.path.rstrip("/") in _docs_paths or request.url.path in _docs_paths:
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'none'; "
+                "script-src 'self' cdn.jsdelivr.net 'unsafe-inline'; "
+                "style-src 'self' cdn.jsdelivr.net 'unsafe-inline'; "
+                "img-src 'self' data: fastapi.tiangolo.com; "
+                "font-src 'self' cdn.jsdelivr.net; "
+                "connect-src 'self'"  # required for Swagger UI fetch() to /openapi.json
+            )
+        else:
+            response.headers["Content-Security-Policy"] = "default-src 'none'"
         # Tell browsers to always use HTTPS for future requests (harmless on HTTP)
         response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
         # Disable browser feature APIs that this API has no use for
