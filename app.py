@@ -54,6 +54,10 @@ ALLOWED_EXTENSIONS: frozenset[str] = frozenset(
     {".mp4", ".webm", ".mkv", ".mp3", ".m4a", ".opus", ".ogg", ".flv", ".avi", ".mov"}
 )
 
+# Disk quota: refuse new downloads if the downloads/ dir exceeds these limits.
+MAX_DOWNLOADS_BYTES: int = 500 * 1024 * 1024   # 500 MB
+MAX_DOWNLOADS_FILES: int = 30
+
 # Allowed CORS origins.
 CORS_ORIGINS: list[str] = ["http://localhost:3000"]
 
@@ -102,9 +106,9 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["GET", "POST"],          # No wildcard – restrict to what's needed
-    allow_headers=["Content-Type", "Authorization"],
+    allow_credentials=False,               # FIX: API is stateless/cookieless – no credentials needed
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],         # Authorization header not used; removed unnecessary exposure
 )
 
 # ---------------------------------------------------------------------------
@@ -117,10 +121,22 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next) -> Response:
         response: Response = await call_next(request)
+        # Prevent MIME-type sniffing
         response.headers["X-Content-Type-Options"] = "nosniff"
+        # Deny embedding in frames (clickjacking)
         response.headers["X-Frame-Options"] = "DENY"
+        # Stop sending the Referer header
         response.headers["Referrer-Policy"] = "no-referrer"
+        # Disable browser caching of responses
         response.headers["Cache-Control"] = "no-store"
+        # Restrict what this API response can load/execute (it's pure JSON/binary)
+        response.headers["Content-Security-Policy"] = "default-src 'none'"
+        # Tell browsers to always use HTTPS for future requests (harmless on HTTP)
+        response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
+        # Disable browser feature APIs that this API has no use for
+        response.headers["Permissions-Policy"] = "geolocation=(), camera=(), microphone=()"
+        # Disable the legacy XSS filter (modern recommendation: set to 0 to avoid bypass attacks)
+        response.headers["X-XSS-Protection"] = "0"
         return response
 
 
@@ -196,12 +212,44 @@ def _sanitize_error(raw: str) -> str:
     return _PATH_PATTERN.sub("<redacted>", excerpt)
 
 
+def _check_disk_quota() -> None:
+    """
+    Abort with HTTP 503 if DOWNLOADS_DIR has grown beyond the configured limits.
+
+    This prevents a flood of requests (before the TTL cleanup task runs) from
+    filling the server's disk completely.
+    """
+    files = [f for f in DOWNLOADS_DIR.iterdir() if f.is_file()]
+    if len(files) >= MAX_DOWNLOADS_FILES:
+        logger.warning(
+            "Disk quota exceeded: %d files in downloads/ (limit=%d)",
+            len(files), MAX_DOWNLOADS_FILES,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Server storage is full. Please try again shortly.",
+        )
+    total_bytes = sum(f.stat().st_size for f in files)
+    if total_bytes >= MAX_DOWNLOADS_BYTES:
+        logger.warning(
+            "Disk quota exceeded: %.1f MB in downloads/ (limit=%.1f MB)",
+            total_bytes / 1024 / 1024, MAX_DOWNLOADS_BYTES / 1024 / 1024,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Server storage is full. Please try again shortly.",
+        )
+
+
 def _run_download(url: str, service_name: str) -> tuple[str, str]:
     """
     Invoke yt-dlp for *url* and return ``(message, filename)`` on success.
 
     Raises :class:`HTTPException` on any failure.
     """
+    # FIX: enforce disk quota before spawning yt-dlp
+    _check_disk_quota()
+
     cmd_prefix = _get_ytdlp_command()
     if not cmd_prefix:
         raise HTTPException(
@@ -235,11 +283,13 @@ def _run_download(url: str, service_name: str) -> tuple[str, str]:
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail=f"Download timed out after {YTDLP_TIMEOUT_SECONDS} seconds.",
         )
-    except OSError as exc:
+    except OSError:
+        # FIX: do NOT forward the raw OSError – it can expose system paths and filenames.
+        logger.exception("OSError while launching yt-dlp for url=%s", url)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Unable to execute yt-dlp: {exc}",
-        ) from exc
+            detail="yt-dlp could not be executed. Please contact the server administrator.",
+        )
 
     if result.returncode != 0:
         # FIX: sanitize error – never expose raw stderr
@@ -254,12 +304,27 @@ def _run_download(url: str, service_name: str) -> tuple[str, str]:
     lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     file_path = Path(lines[-1]) if lines else None
 
-    # Validate the output path is inside DOWNLOADS_DIR (extra safety)
+    # Guard 1: Validate the output path is inside DOWNLOADS_DIR (path traversal)
     if file_path:
         try:
             file_path.resolve().relative_to(DOWNLOADS_DIR.resolve())
         except ValueError:
             file_path = None
+
+    # Guard 2: Re-validate extension of yt-dlp output (defense-in-depth)
+    if file_path and file_path.suffix.lower() not in ALLOWED_EXTENSIONS:
+        logger.warning(
+            "yt-dlp produced a file with disallowed extension '%s': %s",
+            file_path.suffix, file_path.name,
+        )
+        try:
+            file_path.unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Downloaded file has a disallowed format.",
+        )
 
     if not file_path or not file_path.exists():
         raise HTTPException(
