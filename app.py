@@ -26,7 +26,7 @@ DOWNLOADS_DIR.mkdir(exist_ok=True)
 # ---------------------------------------------------------------------------
 
 app = FastAPI(
-    title="Vicatch – Video Download API",
+    title="Media DL – Video Download API",
     description=(
         "Download videos from YouTube, Instagram, Facebook, TikTok, "
         "and any other HTTP(S) URL using **yt-dlp** under the hood.\n\n"
@@ -36,7 +36,7 @@ app = FastAPI(
         "> **Requirement:** `yt-dlp` must be installed (`pip install yt-dlp`)."
     ),
     version="1.0.0",
-    contact={"name": "Vicatch", "url": "https://github.com/your-org/vicatch"},
+    contact={"name": "Media DL", "url": "https://github.com/AmmrYsir/media-dl-api"},
     license_info={"name": "MIT"},
 )
 
