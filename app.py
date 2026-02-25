@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import re
 import shutil
@@ -11,6 +12,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.background import BackgroundTasks
@@ -66,6 +68,42 @@ MAX_DOWNLOADS_FILES: int = 30
 
 # Allowed CORS origins.
 CORS_ORIGINS: list[str] = ["http://localhost:3000"]
+
+# ---------------------------------------------------------------------------
+# SSRF Protection - Block access to private/internal IP ranges
+# ---------------------------------------------------------------------------
+
+PRIVATE_IP_RANGES: list[str] = [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "127.0.0.0/8",
+    "169.254.169.254/32",
+    "169.254.0.0/16",
+    "0.0.0.0/8",
+    "100.64.0.0/10",
+    "192.0.0.0/24",
+    "192.0.2.0/24",
+    "198.51.100.0/24",
+    "203.0.113.0/24",
+    "fc00::/7",
+    "fe80::/10",
+    "::1/128",
+]
+
+
+def is_internal_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+        ip = ipaddress.ip_address(hostname)
+        return any(ip in ipaddress.ip_network(range_) for range_ in PRIVATE_IP_RANGES)
+    except ValueError:
+        return False
+    except Exception:
+        return False
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -585,6 +623,14 @@ class ErrorResponse(BaseModel):
 @limiter.limit(RATE_LIMIT)
 def download_video(request: Request, body: DownloadRequest) -> DownloadResponse:
     url = str(body.url)
+
+    if is_internal_url(url):
+        logger.warning("SSRF attempt blocked: internal URL %s", url)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Access to internal URLs is not allowed.",
+        )
+
     extension = registry.resolve(url)
     if not extension:
         raise HTTPException(
