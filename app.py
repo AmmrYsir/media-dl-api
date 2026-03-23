@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import ipaddress
 import logging
+import os
 import re
+import secrets
 import shutil
+import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.background import BackgroundTasks
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,6 +29,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.responses import Response
 
 # ---------------------------------------------------------------------------
@@ -67,7 +73,29 @@ MAX_DOWNLOADS_BYTES: int = 500 * 1024 * 1024   # 500 MB
 MAX_DOWNLOADS_FILES: int = 30
 
 # Allowed CORS origins.
-CORS_ORIGINS: list[str] = ["http://localhost:3000"]
+CORS_ORIGINS: list[str] = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+    if origin.strip()
+]
+
+# Explicitly trust only expected hostnames in deployed environments.
+ALLOWED_HOSTS: list[str] = [
+    host.strip()
+    for host in os.getenv("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
+    if host.strip()
+]
+
+# Require an API key when MEDIA_DL_API_KEY is set.
+API_KEY: str = os.getenv("MEDIA_DL_API_KEY", "").strip()
+
+# Arbitrary generic URLs are risky. Keep them disabled unless explicitly opted in.
+ENABLE_GENERIC_DOWNLOADS: bool = os.getenv("ENABLE_GENERIC_DOWNLOADS", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 # ---------------------------------------------------------------------------
 # SSRF Protection - Block access to private/internal IP ranges
@@ -92,18 +120,48 @@ PRIVATE_IP_RANGES: list[str] = [
 ]
 
 
+def _is_blocked_ip(ip: ipaddress._BaseAddress) -> bool:
+    return any(ip in ipaddress.ip_network(range_) for range_ in PRIVATE_IP_RANGES)
+
+
 def is_internal_url(url: str) -> bool:
     try:
         parsed = urlparse(url)
         hostname = parsed.hostname
         if not hostname:
-            return False
-        ip = ipaddress.ip_address(hostname)
-        return any(ip in ipaddress.ip_network(range_) for range_ in PRIVATE_IP_RANGES)
+            return True
+
+        try:
+            ip = ipaddress.ip_address(hostname)
+            return _is_blocked_ip(ip)
+        except ValueError:
+            pass
+
+        infos = socket.getaddrinfo(hostname, parsed.port or 80, type=socket.SOCK_STREAM)
+        resolved_ips = {
+            ipaddress.ip_address(info[4][0])
+            for info in infos
+            if info[4] and info[4][0]
+        }
+        if not resolved_ips:
+            return True
+        return any(_is_blocked_ip(ip) for ip in resolved_ips)
     except ValueError:
-        return False
+        return True
     except Exception:
-        return False
+        logger.warning("Failed to validate outbound hostname for url=%s", _redact_url_for_log(url))
+        return True
+
+
+def _redact_url_for_log(url: str) -> str:
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or "<unknown>"
+        path = parsed.path[:64]
+        suffix = "..." if len(parsed.path) > 64 else ""
+        return f"{parsed.scheme}://{host}{path}{suffix}"
+    except Exception:
+        return "<unparseable-url>"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -112,6 +170,66 @@ def is_internal_url(url: str) -> bool:
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOADS_DIR = BASE_DIR / "downloads"
 DOWNLOADS_DIR.mkdir(exist_ok=True)
+
+# One-time download leases map a random token to the generated file and owner.
+download_token_lock = threading.Lock()
+
+
+@dataclass
+class DownloadLease:
+    token: str
+    filename: str
+    owner_ip: str
+    expires_at: float
+
+
+download_leases: dict[str, DownloadLease] = {}
+
+
+def _get_client_ip(request: Request) -> str:
+    return get_remote_address(request)
+
+
+def _create_download_lease(filename: str, owner_ip: str) -> DownloadLease:
+    lease = DownloadLease(
+        token=secrets.token_urlsafe(32),
+        filename=filename,
+        owner_ip=owner_ip,
+        expires_at=time.time() + FILE_TTL_SECONDS,
+    )
+    with download_token_lock:
+        download_leases[lease.token] = lease
+    return lease
+
+
+def _consume_download_lease(token: str, owner_ip: str) -> DownloadLease:
+    with download_token_lock:
+        lease = download_leases.get(token)
+        if lease is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Download token is invalid or has already been used.",
+            )
+        if lease.expires_at <= time.time():
+            download_leases.pop(token, None)
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Download token has expired.",
+            )
+        if lease.owner_ip != owner_ip:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This download token does not belong to your client.",
+            )
+        download_leases.pop(token, None)
+        return lease
+
+
+def _remove_leases_for_filename(filename: str) -> None:
+    with download_token_lock:
+        stale_tokens = [token for token, lease in download_leases.items() if lease.filename == filename]
+        for token in stale_tokens:
+            download_leases.pop(token, None)
 
 # ---------------------------------------------------------------------------
 # Rate limiter
@@ -127,10 +245,10 @@ app = FastAPI(
     title="Media DL – Video Download API",
     description=(
         "Download videos from YouTube, Instagram, Facebook, TikTok, "
-        "and any other HTTP(S) URL using **yt-dlp** under the hood.\n\n"
+        "and optional generic HTTP(S) URLs using **yt-dlp** under the hood.\n\n"
         "### Workflow\n"
-        "1. `POST /api/download` – Submit a URL; receive the download path.\n"
-        "2. `GET  /downloads/{filename}` – Retrieve the downloaded file "
+        "1. `POST /api/download` – Submit a URL; receive a one-time download token.\n"
+        "2. `GET  /downloads/{token}` – Retrieve the downloaded file "
         "(**file is deleted after serving**).\n\n"
         "> **Requirement:** `yt-dlp` must be installed (`pip install yt-dlp`)."
     ),
@@ -138,6 +256,8 @@ app = FastAPI(
     contact={"name": "Media DL", "url": "https://github.com/AmmrYsir/media-dl-api"},
     license_info={"name": "MIT"},
 )
+
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
 
 # Attach rate-limit error handler
 app.state.limiter = limiter
@@ -207,7 +327,7 @@ app.add_middleware(
     allow_origins=CORS_ORIGINS,
     allow_credentials=False,               # FIX: API is stateless/cookieless – no credentials needed
     allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type"],         # Authorization header not used; removed unnecessary exposure
+    allow_headers=["Content-Type", "X-API-Key"],
 )
 
 # ---------------------------------------------------------------------------
@@ -280,7 +400,7 @@ class ServiceRegistry:
 
     def resolve(self, url: str) -> ServiceExtension | None:
         for ext in self._extensions:
-            if ext.matches(url):\
+            if ext.matches(url):
                 return ext
         return None
 
@@ -290,7 +410,18 @@ registry.register(ServiceExtension("YouTube",   re.compile(r"(youtube\.com|youtu
 registry.register(ServiceExtension("Instagram", re.compile(r"instagram\.com", re.I)))
 registry.register(ServiceExtension("Facebook",  re.compile(r"facebook\.com|fb\.watch", re.I)))
 registry.register(ServiceExtension("TikTok",    re.compile(r"tiktok\.com", re.I)))
-registry.register(ServiceExtension("Generic",   re.compile(r"https?://", re.I)))
+if ENABLE_GENERIC_DOWNLOADS:
+    registry.register(ServiceExtension("Generic", re.compile(r"https?://", re.I)))
+
+
+def verify_api_key(x_api_key: str | None = None) -> None:
+    if not API_KEY:
+        return
+    if not x_api_key or not hmac.compare_digest(x_api_key, API_KEY):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid API key.",
+        )
 
 # ---------------------------------------------------------------------------
 # yt-dlp helpers
@@ -419,7 +550,7 @@ def _run_download(url: str, service_name: str) -> tuple[str, str]:
         size_mb = probed_size / 1024 / 1024
         logger.warning(
             "Blocked oversized video %.0f MB > limit %s for url=%s",
-            size_mb, MAX_VIDEO_SIZE_LABEL, url,
+            size_mb, MAX_VIDEO_SIZE_LABEL, _redact_url_for_log(url),
         )
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
@@ -429,11 +560,18 @@ def _run_download(url: str, service_name: str) -> tuple[str, str]:
             ),
         )
     elif probed_size is None:
-        logger.info("File size unknown for url=%s – proceeding with --max-filesize guard", url)
+        logger.info(
+            "File size unknown for url=%s – proceeding with --max-filesize guard",
+            _redact_url_for_log(url),
+        )
     else:
-        logger.info("Pre-download size check passed: %.0f MB for url=%s", probed_size / 1024 / 1024, url)
+        logger.info(
+            "Pre-download size check passed: %.0f MB for url=%s",
+            probed_size / 1024 / 1024,
+            _redact_url_for_log(url),
+        )
 
-    logger.info("Starting download [service=%s] url=%s", service_name, url)
+    logger.info("Starting download [service=%s] url=%s", service_name, _redact_url_for_log(url))
 
     try:
         result = subprocess.run(
@@ -444,14 +582,18 @@ def _run_download(url: str, service_name: str) -> tuple[str, str]:
             timeout=YTDLP_TIMEOUT_SECONDS,   # FIX: prevents indefinite hang
         )
     except subprocess.TimeoutExpired:
-        logger.warning("yt-dlp timed out after %ds for url=%s", YTDLP_TIMEOUT_SECONDS, url)
+        logger.warning(
+            "yt-dlp timed out after %ds for url=%s",
+            YTDLP_TIMEOUT_SECONDS,
+            _redact_url_for_log(url),
+        )
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail=f"Download timed out after {YTDLP_TIMEOUT_SECONDS} seconds.",
         )
     except OSError:
         # FIX: do NOT forward the raw OSError – it can expose system paths and filenames.
-        logger.exception("OSError while launching yt-dlp for url=%s", url)
+        logger.exception("OSError while launching yt-dlp for url=%s", _redact_url_for_log(url))
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="yt-dlp could not be executed. Please contact the server administrator.",
@@ -461,7 +603,12 @@ def _run_download(url: str, service_name: str) -> tuple[str, str]:
         # FIX: sanitize error – never expose raw stderr
         raw_error = result.stderr.strip() or result.stdout.strip() or "Unknown download error."
         safe_error = _sanitize_error(raw_error)
-        logger.warning("yt-dlp failed [rc=%d] url=%s error=%s", result.returncode, url, raw_error)
+        logger.warning(
+            "yt-dlp failed [rc=%d] url=%s error=%s",
+            result.returncode,
+            _redact_url_for_log(url),
+            safe_error,
+        )
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"{service_name} download failed: {safe_error}",
@@ -510,6 +657,7 @@ def _delete_file(path: Path) -> None:
     """Safely remove *path* from disk, logging outcome."""
     try:
         path.unlink(missing_ok=True)
+        _remove_leases_for_filename(path.name)
         logger.info("Deleted file: %s", path.name)
     except Exception as exc:  # noqa: BLE001
         logger.error("Failed to delete %s: %s", path.name, exc)
@@ -525,6 +673,12 @@ async def _cleanup_loop() -> None:
     while True:
         await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
         now = time.time()
+        with download_token_lock:
+            expired_tokens = [
+                token for token, lease in download_leases.items() if lease.expires_at <= now
+            ]
+            for token in expired_tokens:
+                download_leases.pop(token, None)
         for f in DOWNLOADS_DIR.iterdir():
             if not f.is_file():
                 continue
@@ -571,6 +725,7 @@ class DownloadResponse(BaseModel):
     message: str
     filename: str
     download_url: str
+    download_token: str
     expires_in_seconds: int
 
     model_config = {
@@ -580,7 +735,8 @@ class DownloadResponse(BaseModel):
                     "status": "success",
                     "message": "Download completed via YouTube.",
                     "filename": "Rick_Astley-Never_Gonna_Give_You_Up-dQw4w9WgXcQ.mp4",
-                    "download_url": "/downloads/Rick_Astley-Never_Gonna_Give_You_Up-dQw4w9WgXcQ.mp4",
+                    "download_url": "/downloads/abc123",
+                    "download_token": "abc123",
                     "expires_in_seconds": 900,
                 }
             ]
@@ -606,13 +762,14 @@ class ErrorResponse(BaseModel):
     summary="Download a video",
     description=(
         "Submit any HTTP/HTTPS URL. The server resolves the appropriate service "
-        "(YouTube, Instagram, Facebook, TikTok, or generic), invokes **yt-dlp**, "
+        "(YouTube, Instagram, Facebook, TikTok, or generic if explicitly enabled), invokes **yt-dlp**, "
         "saves the file temporarily to the `downloads/` directory, and returns the "
-        "file name plus a direct download URL.\n\n"
+        "file name plus a one-time download URL.\n\n"
         f"> ⏱ File expires in **{FILE_TTL_SECONDS // 60} minutes** or on first fetch."
     ),
     responses={
         200: {"model": DownloadResponse, "description": "Video downloaded successfully."},
+        401: {"model": ErrorResponse, "description": "Missing or invalid API key."},
         422: {"model": ErrorResponse, "description": "yt-dlp reported a download error."},
         429: {"model": ErrorResponse, "description": "Rate limit exceeded."},
         503: {"model": ErrorResponse, "description": "yt-dlp is not installed or cannot run."},
@@ -621,11 +778,16 @@ class ErrorResponse(BaseModel):
     tags=["Video Download"],
 )
 @limiter.limit(RATE_LIMIT)
-def download_video(request: Request, body: DownloadRequest) -> DownloadResponse:
+def download_video(
+    request: Request,
+    body: DownloadRequest,
+    _api_key_ok: str | None = Header(default=None, alias="X-API-Key"),
+) -> DownloadResponse:
+    verify_api_key(_api_key_ok)
     url = str(body.url)
 
     if is_internal_url(url):
-        logger.warning("SSRF attempt blocked: internal URL %s", url)
+        logger.warning("SSRF attempt blocked: internal URL %s", _redact_url_for_log(url))
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Access to internal URLs is not allowed.",
@@ -638,33 +800,46 @@ def download_video(request: Request, body: DownloadRequest) -> DownloadResponse:
             detail="No extension available for this URL.",
         )
 
+    client_ip = _get_client_ip(request)
     message, filename = _run_download(url, extension.name)
+    lease = _create_download_lease(filename, client_ip)
     return DownloadResponse(
         status="success",
         message=message,
         filename=filename,
-        download_url=f"/downloads/{filename}",
+        download_url=f"/downloads/{lease.token}",
+        download_token=lease.token,
         expires_in_seconds=FILE_TTL_SECONDS,
     )
 
 
 @app.get(
-    "/downloads/{filename}",
+    "/downloads/{token}",
     summary="Retrieve a downloaded file",
     description=(
         "Stream a previously downloaded file back to the client. "
-        "The `filename` must exactly match a file in the server's `downloads/` directory.\n\n"
+        "The `token` must be the one-time token returned by `POST /api/download`.\n\n"
         "> ⚠️ **The file is permanently deleted from the server after this request.**"
     ),
     responses={
         200: {"description": "The requested file is returned as a binary download."},
         400: {"model": ErrorResponse, "description": "Path traversal attempt or disallowed extension."},
+        401: {"model": ErrorResponse, "description": "Missing or invalid API key."},
+        403: {"model": ErrorResponse, "description": "Token does not belong to this client."},
         404: {"model": ErrorResponse, "description": "File not found or already deleted."},
     },
     tags=["Video Download"],
 )
-def get_downloaded_file(filename: str, background_tasks: BackgroundTasks) -> FileResponse:
+def get_downloaded_file(
+    token: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    _api_key_ok: str | None = Header(default=None, alias="X-API-Key"),
+) -> FileResponse:
     """Stream the file to the caller, then delete it from disk."""
+    verify_api_key(_api_key_ok)
+    lease = _consume_download_lease(token, _get_client_ip(request))
+    filename = lease.filename
 
     # --- Guard 1: Path traversal ---
     safe = (DOWNLOADS_DIR / filename).resolve()

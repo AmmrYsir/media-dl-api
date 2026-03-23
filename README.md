@@ -1,19 +1,19 @@
-﻿# media-dl-api — Video Download API
+# media-dl-api - Video Download API
 
-A **FastAPI** REST API that wraps [yt-dlp](https://github.com/yt-dlp/yt-dlp) to download videos from YouTube, Instagram, Facebook, TikTok, and any generic HTTP(S) URL.
+A **FastAPI** REST API that wraps [yt-dlp](https://github.com/yt-dlp/yt-dlp) to download videos from YouTube, Instagram, Facebook, and TikTok. Generic arbitrary HTTP(S) URLs are disabled by default and must be explicitly enabled.
 
 ---
 
 ## Requirements
 
-| Requirement | Version   |
-|-------------|-----------|
-| Python      | 3.10 +    |
-| fastapi     | latest    |
-| uvicorn     | latest    |
-| yt-dlp      | latest    |
-| slowapi     | latest    |
-| pydantic    | latest    |
+| Requirement | Version |
+|-------------|---------|
+| Python | 3.10+ |
+| fastapi | latest |
+| uvicorn | latest |
+| yt-dlp | latest |
+| slowapi | latest |
+| pydantic | latest |
 
 ---
 
@@ -52,39 +52,50 @@ pip install -r requirements.txt
 uvicorn app:app --reload --host 0.0.0.0 --port 8000
 ```
 
-| Flag              | Purpose                                          |
-|-------------------|--------------------------------------------------|
-| `--reload`        | Auto-restart on code changes (development only)  |
-| `--host 0.0.0.0`  | Listen on all network interfaces                 |
-| `--port 8000`     | TCP port (change freely)                         |
-
 For production, drop `--reload` and consider multiple workers:
 
 ```bash
 uvicorn app:app --host 0.0.0.0 --port 8000 --workers 4
 ```
 
+### Recommended production environment
+
+Set these before exposing the service publicly:
+
+```bash
+# Linux / macOS
+export ALLOWED_HOSTS=media.example.com
+export MEDIA_DL_API_KEY=replace-with-a-long-random-secret
+export CORS_ORIGINS=https://app.example.com
+export ENABLE_GENERIC_DOWNLOADS=false
+```
+
+```powershell
+# Windows PowerShell
+$env:ALLOWED_HOSTS="media.example.com"
+$env:MEDIA_DL_API_KEY="replace-with-a-long-random-secret"
+$env:CORS_ORIGINS="https://app.example.com"
+$env:ENABLE_GENERIC_DOWNLOADS="false"
+```
+
+Notes:
+- `ALLOWED_HOSTS` should include the exact public hostname(s) you will serve.
+- `MEDIA_DL_API_KEY` makes both download endpoints require `X-API-Key`.
+- `ENABLE_GENERIC_DOWNLOADS` is intentionally off by default because it materially increases SSRF risk.
+
 ---
 
-## Interactive API Docs (Swagger UI)
+## Interactive API Docs
 
-Once the server is running, open your browser:
+Once the server is running, open:
 
-| URL                                | Description                               |
-|------------------------------------|-------------------------------------------|
-| http://localhost:8000/docs         | **Swagger UI** — try endpoints interactively |
-| http://localhost:8000/redoc        | **ReDoc** — clean reference view          |
-| http://localhost:8000/openapi.json | Raw OpenAPI 3.1 schema                    |
+| URL | Description |
+|-----|-------------|
+| `http://localhost:8000/docs` | Swagger UI |
+| `http://localhost:8000/redoc` | ReDoc |
+| `http://localhost:8000/openapi.json` | Raw OpenAPI schema |
 
-### Using Swagger UI
-
-1. Open **http://localhost:8000/docs**
-2. Click on an endpoint (e.g. `POST /api/download`) to expand it
-3. Click **Try it out**
-4. Fill in the request body (e.g. a YouTube URL)
-5. Click **Execute** — the response appears inline with status code, headers, and body
-
-> **Note:** The security middleware applies a strict `Content-Security-Policy` to all API routes, but automatically relaxes it for `/docs` and `/redoc` to allow the Swagger UI CDN assets to load correctly.
+If `MEDIA_DL_API_KEY` is set, include `X-API-Key` when trying endpoints from Swagger.
 
 ---
 
@@ -92,9 +103,13 @@ Once the server is running, open your browser:
 
 ### `POST /api/download`
 
-Submit a video URL for download.
+Submit a supported video URL for download.
 
-**Request body** (`application/json`)
+Headers:
+- `Content-Type: application/json`
+- `X-API-Key: <secret>` if `MEDIA_DL_API_KEY` is configured
+
+**Request body**
 
 ```json
 {
@@ -102,97 +117,95 @@ Submit a video URL for download.
 }
 ```
 
-**Success response** `200 OK`
+**Success response**
 
 ```json
 {
   "status": "success",
   "message": "Download completed via YouTube.",
   "filename": "Rick_Astley-Never_Gonna_Give_You_Up-dQw4w9WgXcQ.mp4",
-  "download_url": "/downloads/Rick_Astley-Never_Gonna_Give_You_Up-dQw4w9WgXcQ.mp4",
+  "download_url": "/downloads/6fY0v8m8p8l4f8S4dW2P4A",
+  "download_token": "6fY0v8m8p8l4f8S4dW2P4A",
   "expires_in_seconds": 900
 }
 ```
 
-**Error responses**
+Error responses:
 
-| Status | Meaning                                          |
-|--------|--------------------------------------------------|
-| `413`  | Video file exceeds the 1 GB size limit           |
-| `422`  | yt-dlp reported a download error or invalid URL  |
-| `429`  | Rate limit exceeded (5 requests/minute per IP)   |
-| `503`  | yt-dlp is not installed or cannot be executed    |
-| `504`  | Download timed out (> 5 minutes)                 |
+| Status | Meaning |
+|--------|---------|
+| `400` | Internal/private destination blocked |
+| `401` | Missing or invalid API key |
+| `413` | Video file exceeds the size limit |
+| `422` | Invalid URL or yt-dlp download failure |
+| `429` | Rate limit exceeded |
+| `503` | yt-dlp is not installed or storage quota reached |
+| `504` | Download timed out |
 
----
+### `GET /downloads/{token}`
 
-### `GET /downloads/{filename}`
+Retrieve a previously downloaded file.
 
-Stream a previously downloaded file back to the caller.
+- `token` must be the `download_token` from `POST /api/download`
+- the token is one-time use
+- the token is bound to the same client IP that created it
+- the file is deleted after it is served
 
-- `filename` must exactly match the value returned by `POST /api/download`.
-- The file is served as `application/octet-stream` (binary download).
-- **The file is permanently deleted from the server after this request.**
-- Files also expire automatically after **15 minutes** if never retrieved.
+Error responses:
 
-**Error responses**
-
-| Status | Meaning                                              |
-|--------|------------------------------------------------------|
-| `400`  | Path traversal attempt or disallowed file extension  |
-| `404`  | File does not exist or has already been deleted      |
+| Status | Meaning |
+|--------|---------|
+| `401` | Missing or invalid API key |
+| `403` | Token does not belong to this client |
+| `404` | Token expired, already used, or file missing |
 
 ---
 
 ## Security
 
-| Feature                 | Detail                                                          |
-|-------------------------|-----------------------------------------------------------------|
-| Rate limiting           | 5 downloads per minute per IP (via slowapi)                     |
-| File TTL                | Downloaded files auto-deleted after 15 minutes                  |
-| Delete-after-serve      | Files are deleted immediately after being retrieved             |
-| Max file size           | 1 GB hard limit (pre-download probe + yt-dlp `--max-filesize`)  |
-| Disk quota              | Server refuses new jobs if `downloads/` exceeds 500 MB / 30 files |
-| Path traversal guard    | All filename inputs are validated against `downloads/` directory |
-| Extension whitelist     | Only `.mp4 .webm .mkv .mp3 .m4a .opus .ogg .flv .avi .mov` served |
-| Security headers        | X-Content-Type-Options, X-Frame-Options, HSTS, CSP, and more   |
-| Error sanitization      | Raw yt-dlp stderr is sanitized before being sent to callers     |
-| CORS                    | Restricted to `http://localhost:3000` by default                |
+| Feature | Detail |
+|---------|--------|
+| Rate limiting | 5 download requests per minute per IP |
+| File TTL | Downloaded files expire after 15 minutes |
+| One-time tokens | File retrieval uses short-lived random tokens |
+| IP binding | Download tokens are bound to the creating client IP |
+| Delete-after-serve | Files are removed after successful retrieval |
+| Max file size | 1 GB hard limit with probe plus yt-dlp guard |
+| Disk quota | New jobs are rejected when `downloads/` is too full |
+| Trusted hosts | Requests must match `ALLOWED_HOSTS` |
+| Optional API key | `MEDIA_DL_API_KEY` protects both endpoints |
+| SSRF protection | Hostnames are resolved and blocked if they map to private/internal IPs |
+| Extension whitelist | Only approved media extensions are served |
+| Security headers | CSP, HSTS, X-Frame-Options, no-sniff, and related headers |
+| Error sanitization | Raw yt-dlp stderr is sanitized before returning to clients |
+| Safer logging | Request URLs are redacted before logging |
+| CORS | Controlled through `CORS_ORIGINS` |
 
 ---
 
 ## Supported Services
 
-| Service   | Matched pattern                        |
-|-----------|----------------------------------------|
-| YouTube   | `youtube.com`, `youtu.be`              |
-| Instagram | `instagram.com`                        |
-| Facebook  | `facebook.com`, `fb.watch`             |
-| TikTok    | `tiktok.com`                           |
-| Generic   | Any `http://` or `https://` URL        |
+| Service | Matched pattern |
+|---------|-----------------|
+| YouTube | `youtube.com`, `youtu.be` |
+| Instagram | `instagram.com` |
+| Facebook | `facebook.com`, `fb.watch` |
+| TikTok | `tiktok.com` |
+| Generic | Optional and disabled by default |
 
 ---
 
-## Project Structure
-
-```
-media-dl-api/
-├── app.py           # FastAPI application (routes, middleware, yt-dlp logic)
-├── requirements.txt # Python dependencies
-├── downloads/       # Temporary download directory (auto-created)
-└── README.md
-```
-
----
-
-## Example — curl
+## Example - curl
 
 ```bash
 # 1. Trigger a download
 curl -X POST http://localhost:8000/api/download \
      -H "Content-Type: application/json" \
+     -H "X-API-Key: replace-with-a-long-random-secret" \
      -d '{"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"}'
 
-# 2. Save the file locally (use the filename from step 1's response)
-curl -OJ http://localhost:8000/downloads/<filename>
+# 2. Save the file locally using the returned download_token
+curl -OJ \
+     -H "X-API-Key: replace-with-a-long-random-secret" \
+     http://localhost:8000/downloads/<download_token>
 ```
